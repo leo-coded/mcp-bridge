@@ -3,7 +3,7 @@
 /**
  * @file anima-mcp-bridge.js
  * @description Bridge between Microsoft Entra ID and Anima MCP Server.
- * @version 1.0.2 (Cros OS compatibility)
+ * @version 1.0.4 (Fixed Token Lifecycle & Spawning)
  * @license GPL-3.0
  */
 
@@ -22,10 +22,11 @@ const CONFIG = {
     REMOTE_MCP_URL: process.env.ANIMA_MCP_URL || "https://cloudapp-dev.animaeducacao.com.br/servico-hackathon-mcp/mcp",
     CACHE_PATH: path.join(os.homedir(), ".anima-mcp-cache.enc"),
     WINDOW_TITLE: "AnimaMCPAuth",
-    USER_AGENT: "Anima-MCP-Bridge/1.0.2",
+    USER_AGENT: "Anima-MCP-Bridge/1.0.4",
     PINNED_MCP_REMOTE_VER: "mcp-remote@0.1.3",
     REQUEST_TIMEOUT: 15000,
-    MAX_AUTH_POLLING_SEC: 900
+    MAX_AUTH_POLLING_SEC: 900,
+    DEFAULT_PAT_TTL: 900
 };
 
 const ALLOWED_HOSTS = [
@@ -172,16 +173,29 @@ function request(url, method, headers, body) {
     });
 }
 
-async function getValidToken() {
+function loadCache() {
     if (fs.existsSync(CONFIG.CACHE_PATH)) {
         try {
             const encryptedData = fs.readFileSync(CONFIG.CACHE_PATH, "utf8");
             const decrypted = decrypt(encryptedData);
-            if (decrypted) {
-                const cache = JSON.parse(decrypted);
-                if (Date.now() < (cache.expires_at - 60000)) return cache.access_token;
-            }
-        } catch (e) { log("Cache invalid.", "WARN"); }
+            if (decrypted) return JSON.parse(decrypted);
+        } catch (e) { log("Cache read error.", "WARN"); }
+    }
+    return {};
+}
+
+function saveCache(data) {
+    try {
+        const existing = loadCache();
+        const updated = { ...existing, ...data };
+        fs.writeFileSync(CONFIG.CACHE_PATH, encrypt(JSON.stringify(updated)));
+    } catch (e) { log("Cache write error.", "ERROR"); }
+}
+
+async function getValidToken() {
+    const cache = loadCache();
+    if (cache.entra && cache.entra.access_token && Date.now() < (cache.entra.expires_at - 60000)) {
+        return cache.entra.access_token;
     }
 
     if (!askConsent()) throw new Error("User declined authentication.");
@@ -210,9 +224,12 @@ async function getValidToken() {
 
         if (tokenRes.data.access_token) {
             cleanup();
-            const cacheData = JSON.stringify({ access_token: tokenRes.data.access_token, expires_at: Date.now() + (tokenRes.data.expires_in * 1000) });
-            fs.writeFileSync(CONFIG.CACHE_PATH, encrypt(cacheData));
-            log("Authentication successful.", "AUDIT");
+            const entraData = { 
+                access_token: tokenRes.data.access_token, 
+                expires_at: Date.now() + (tokenRes.data.expires_in * 1000) 
+            };
+            saveCache({ entra: entraData });
+            log("Microsoft authentication successful.", "AUDIT");
             return tokenRes.data.access_token;
         }
         if (tokenRes.data.error !== "authorization_pending") {
@@ -222,29 +239,59 @@ async function getValidToken() {
     }
 }
 
+async function getValidPAT(entraToken) {
+    const cache = loadCache();
+    if (cache.pat && cache.pat.token && Date.now() < (cache.pat.expires_at - 30000)) {
+        return cache.pat;
+    }
+
+    log("Requesting new PAT from backend...", "INFO");
+    const patRes = await request(CONFIG.PAT_URL, "POST", { 
+        "Authorization": `Bearer ${entraToken}`, 
+        "Content-Type": "application/json" 
+    }, {});
+
+    const token = patRes.data.personalAccessToken;
+    if (!token) throw new Error(`Backend returned ${patRes.status}. Check permissions.`);
+
+    const ttlSeconds = patRes.data.expiresIn || patRes.data.ttlSeconds || CONFIG.DEFAULT_PAT_TTL;
+    const patData = {
+        token: token,
+        expires_at: Date.now() + (ttlSeconds * 1000)
+    };
+
+    saveCache({ pat: patData });
+    return patData;
+}
+
 async function start() {
     try {
         const entraToken = await getValidToken();
-        const patRes = await request(CONFIG.PAT_URL, "POST", { 
-            "Authorization": `Bearer ${entraToken}`, 
-            "Content-Type": "application/json" 
-        }, {});
+        const patData = await getValidPAT(entraToken);
 
-        const pat = patRes.data.personalAccessToken;
-        if (!pat) throw new Error(`Backend returned ${patRes.status}. Check permissions.`);
-
-        log("BRIDGE ACTIVE. Establishing tunnel...", "INFO");
+        log(`BRIDGE ACTIVE. PAT expires in ${Math.round((patData.expires_at - Date.now()) / 1000)}s.`, "INFO");
         
+        const timeUntilExpiry = patData.expires_at - Date.now();
+        const exitBuffer = 30000; 
+        
+        if (timeUntilExpiry > exitBuffer) {
+            setTimeout(() => {
+                log("PAT approaching expiration. Restarting bridge to refresh token...", "WARN");
+                process.exit(0); 
+            }, timeUntilExpiry - exitBuffer);
+        }
+
         let mcp;
         if (process.platform === "win32") {
-            const cmd = `npx -y --quiet ${CONFIG.PINNED_MCP_REMOTE_VER} ${CONFIG.REMOTE_MCP_URL} --header "Authorization: Bearer ${pat}" --header "Accept: application/json"`;
+            // Restored original spawning logic for Windows
+            const cmd = `npx -y --quiet ${CONFIG.PINNED_MCP_REMOTE_VER} ${CONFIG.REMOTE_MCP_URL} --header "Authorization: Bearer ${patData.token}" --header "Accept: application/json"`;
             mcp = spawn(cmd, [], { 
                 shell: true, 
                 stdio: ["inherit", "inherit", "pipe"],
                 env: { ...process.env, NO_UPDATE_NOTIFIER: "true" }
             });
         } else {
-            const args = ["-y", "--quiet", CONFIG.PINNED_MCP_REMOTE_VER, CONFIG.REMOTE_MCP_URL, "--header", `Authorization: Bearer ${pat}`, "--header", "Accept: application/json"];
+            const args = ["-y", "--quiet", CONFIG.PINNED_MCP_REMOTE_VER, CONFIG.REMOTE_MCP_URL, "--header", `Authorization: Bearer ${patData.token}`, "--header", "Accept: application/json"];
             mcp = spawn("npx", args, { stdio: ["inherit", "inherit", "pipe"] });
         }
 
