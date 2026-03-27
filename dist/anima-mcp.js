@@ -3,7 +3,7 @@
 /**
  * @file anima-mcp-bridge.js
  * @description Bridge between Microsoft Entra ID and Anima MCP Server.
- * @version 1.0.4 (Fixed Token Lifecycle & Spawning)
+ * @version 1.0.5 (Fixed Token Refresh, Header Spacing & Process Lifecycle)
  * @license GPL-3.0
  */
 
@@ -22,11 +22,12 @@ const CONFIG = {
     REMOTE_MCP_URL: process.env.ANIMA_MCP_URL || "https://cloudapp-dev.animaeducacao.com.br/servico-hackathon-mcp/mcp",
     CACHE_PATH: path.join(os.homedir(), ".anima-mcp-cache.enc"),
     WINDOW_TITLE: "AnimaMCPAuth",
-    USER_AGENT: "Anima-MCP-Bridge/1.0.4",
+    USER_AGENT: "Anima-MCP-Bridge/1.0.5",
     PINNED_MCP_REMOTE_VER: "mcp-remote@0.1.3",
     REQUEST_TIMEOUT: 15000,
     MAX_AUTH_POLLING_SEC: 900,
-    DEFAULT_PAT_TTL: 900
+    DEFAULT_PAT_TTL: 900,
+    EXPIRY_BUFFER_SEC: 60 // Increased buffer for safety
 };
 
 const ALLOWED_HOSTS = [
@@ -67,8 +68,12 @@ function decrypt(cipherText) {
 }
 
 let activeGuiProcess = null;
+let mcpProcess = null;
 
 function cleanup() {
+    if (mcpProcess) {
+        try { mcpProcess.kill(); } catch (e) {}
+    }
     if (!activeGuiProcess) return;
     try {
         if (process.platform === "win32") {
@@ -194,10 +199,34 @@ function saveCache(data) {
 
 async function getValidToken() {
     const cache = loadCache();
+    
+    // 1. Check if current access token is still valid
     if (cache.entra && cache.entra.access_token && Date.now() < (cache.entra.expires_at - 60000)) {
         return cache.entra.access_token;
     }
 
+    // 2. Try to refresh using Refresh Token if available
+    if (cache.entra && cache.entra.refresh_token) {
+        log("Attempting to refresh Microsoft Entra token...", "INFO");
+        const refreshRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST",
+            { "Content-Type": "application/x-www-form-urlencoded" },
+            `grant_type=refresh_token&client_id=${CONFIG.CLIENT_ID}&refresh_token=${cache.entra.refresh_token}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`
+        );
+
+        if (refreshRes.data.access_token) {
+            const entraData = { 
+                access_token: refreshRes.data.access_token, 
+                refresh_token: refreshRes.data.refresh_token || cache.entra.refresh_token,
+                expires_at: Date.now() + (refreshRes.data.expires_in * 1000) 
+            };
+            saveCache({ entra: entraData });
+            log("Microsoft token refreshed successfully.", "AUDIT");
+            return refreshRes.data.access_token;
+        }
+        log("Refresh token expired or invalid. Starting new login flow...", "WARN");
+    }
+
+    // 3. Fallback to Device Code Flow
     if (!askConsent()) throw new Error("User declined authentication.");
 
     const deviceRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/devicecode`, "POST", 
@@ -226,6 +255,7 @@ async function getValidToken() {
             cleanup();
             const entraData = { 
                 access_token: tokenRes.data.access_token, 
+                refresh_token: tokenRes.data.refresh_token,
                 expires_at: Date.now() + (tokenRes.data.expires_in * 1000) 
             };
             saveCache({ entra: entraData });
@@ -272,35 +302,35 @@ async function start() {
         log(`BRIDGE ACTIVE. PAT expires in ${Math.round((patData.expires_at - Date.now()) / 1000)}s.`, "INFO");
         
         const timeUntilExpiry = patData.expires_at - Date.now();
-        const exitBuffer = 30000; 
+        const exitBuffer = CONFIG.EXPIRY_BUFFER_SEC * 1000; 
         
         if (timeUntilExpiry > exitBuffer) {
             setTimeout(() => {
                 log("PAT approaching expiration. Restarting bridge to refresh token...", "WARN");
+                cleanup(); // Kill child process before exiting
                 process.exit(0); 
             }, timeUntilExpiry - exitBuffer);
         }
 
-        let mcp;
+        // Fix: Removed space after colon in headers to prevent double-spacing issues
         if (process.platform === "win32") {
-            // Restored original spawning logic for Windows
-            const cmd = `npx -y --quiet ${CONFIG.PINNED_MCP_REMOTE_VER} ${CONFIG.REMOTE_MCP_URL} --header "Authorization: Bearer ${patData.token}" --header "Accept: application/json"`;
-            mcp = spawn(cmd, [], { 
+            const cmd = `npx -y --quiet ${CONFIG.PINNED_MCP_REMOTE_VER} ${CONFIG.REMOTE_MCP_URL} --header "Authorization:Bearer ${patData.token}" --header "Accept:application/json"`;
+            mcpProcess = spawn(cmd, [], { 
                 shell: true, 
                 stdio: ["inherit", "inherit", "pipe"],
                 env: { ...process.env, NO_UPDATE_NOTIFIER: "true" }
             });
         } else {
-            const args = ["-y", "--quiet", CONFIG.PINNED_MCP_REMOTE_VER, CONFIG.REMOTE_MCP_URL, "--header", `Authorization: Bearer ${patData.token}`, "--header", "Accept: application/json"];
-            mcp = spawn("npx", args, { stdio: ["inherit", "inherit", "pipe"] });
+            const args = ["-y", "--quiet", CONFIG.PINNED_MCP_REMOTE_VER, CONFIG.REMOTE_MCP_URL, "--header", `Authorization:Bearer ${patData.token}`, "--header", "Accept:application/json"];
+            mcpProcess = spawn("npx", args, { stdio: ["inherit", "inherit", "pipe"] });
         }
 
-        mcp.stderr.on("data", (d) => process.stderr.write(d));
-        mcp.on("error", (err) => {
+        mcpProcess.stderr.on("data", (d) => process.stderr.write(d));
+        mcpProcess.on("error", (err) => {
             log(`Failed to start MCP: ${err.message}`, "ERROR");
             process.exit(1);
         });
-        mcp.on("exit", (code) => {
+        mcpProcess.on("exit", (code) => {
             log(`MCP exited with code ${code}`, "INFO");
             process.exit(code || 0);
         });
