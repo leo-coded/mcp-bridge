@@ -3,7 +3,7 @@
 /**
  * @file anima-mcp-bridge.js
  * @description Bridge between Microsoft Entra ID and Anima MCP Server.
- * @version 1.0.5 (Fixed Token Refresh, Header Spacing & Process Lifecycle)
+ * @version 1.1.7 (Final Seamless Bridge)
  * @license GPL-3.0
  */
 
@@ -13,6 +13,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const readline = require("readline");
 
 const CONFIG = {
     TENANT_ID: process.env.ANIMA_TENANT_ID || "80f6a699-b024-4b7b-8cca-5ecfdd2a2fe3",
@@ -22,19 +23,16 @@ const CONFIG = {
     REMOTE_MCP_URL: process.env.ANIMA_MCP_URL || "https://cloudapp-dev.animaeducacao.com.br/servico-hackathon-mcp/mcp",
     CACHE_PATH: path.join(os.homedir(), ".anima-mcp-cache.enc"),
     WINDOW_TITLE: "AnimaMCPAuth",
-    USER_AGENT: "Anima-MCP-Bridge/1.0.5",
+    USER_AGENT: "Anima-MCP-Bridge/1.1.7",
     PINNED_MCP_REMOTE_VER: "mcp-remote@0.1.3",
     REQUEST_TIMEOUT: 15000,
     MAX_AUTH_POLLING_SEC: 900,
     DEFAULT_PAT_TTL: 900,
-    EXPIRY_BUFFER_SEC: 60 // Increased buffer for safety
+    // Production Buffer: Refresh 2 minutes before PAT expires
+    RESTART_BUFFER_MS: 120000 
 };
 
-const ALLOWED_HOSTS = [
-    "login.microsoftonline.com",
-    "cloudapp-dev.animaeducacao.com.br"
-];
-
+const ALLOWED_HOSTS = ["login.microsoftonline.com", "cloudapp-dev.animaeducacao.com.br"];
 const correlationId = crypto.randomBytes(4).toString('hex');
 
 const log = (msg, level = "INFO") => {
@@ -42,304 +40,200 @@ const log = (msg, level = "INFO") => {
     process.stderr.write(`[${timestamp}] [${correlationId}] [${level}] ${msg}\n`);
 };
 
+// --- Encryption & Cache ---
 function getEncryptionKey() {
     const machineFingerprint = os.userInfo().username + os.homedir();
     return crypto.scryptSync(machineFingerprint, 'anima-salt-v1', 32);
 }
-
 function encrypt(text) {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', getEncryptionKey(), iv);
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
-    const authTag = cipher.getAuthTag().toString('hex');
-    return `${iv.toString('hex')}:${authTag}:${encrypted}`;
+    return `${iv.toString('hex')}:${cipher.getAuthTag().toString('hex')}:${encrypted}`;
 }
-
 function decrypt(cipherText) {
     try {
         const [ivHex, authTagHex, encrypted] = cipherText.split(':');
         const decipher = crypto.createDecipheriv('aes-256-gcm', getEncryptionKey(), Buffer.from(ivHex, 'hex'));
         decipher.setAuthTag(Buffer.from(authTagHex, 'hex'));
-        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-        decrypted += decipher.final('utf8');
-        return decrypted;
+        return decipher.update(encrypted, 'hex', 'utf8') + decipher.final('utf8');
     } catch (e) { return null; }
 }
-
-let activeGuiProcess = null;
-let mcpProcess = null;
-
-function cleanup() {
-    if (mcpProcess) {
-        try { mcpProcess.kill(); } catch (e) {}
+function loadCache() {
+    if (fs.existsSync(CONFIG.CACHE_PATH)) {
+        try {
+            const decrypted = decrypt(fs.readFileSync(CONFIG.CACHE_PATH, "utf8"));
+            if (decrypted) return JSON.parse(decrypted);
+        } catch (e) {}
     }
-    if (!activeGuiProcess) return;
-    try {
-        if (process.platform === "win32") {
-            spawnSync("taskkill", ["/FI", `WINDOWTITLE eq ${CONFIG.WINDOW_TITLE}*`, "/F", "/T"], { stdio: 'ignore' });
-        } else {
-            activeGuiProcess.kill('SIGTERM');
-        }
-    } catch (e) { }
+    return {};
+}
+function saveCache(data) {
+    const updated = { ...loadCache(), ...data };
+    fs.writeFileSync(CONFIG.CACHE_PATH, encrypt(JSON.stringify(updated)));
 }
 
-process.on("SIGINT", cleanup);
-process.on("SIGTERM", cleanup);
-
+// --- GUI & Network ---
+let activeGuiProcess = null;
+function cleanupGui() {
+    if (!activeGuiProcess) return;
+    try {
+        if (process.platform === "win32") spawnSync("taskkill", ["/FI", `WINDOWTITLE eq ${CONFIG.WINDOW_TITLE}*`, "/F", "/T"], { stdio: 'ignore' });
+        else activeGuiProcess.kill('SIGTERM');
+    } catch (e) { }
+    activeGuiProcess = null;
+}
 function showAuthGui(userCode, verificationUri) {
     const platform = process.platform;
     if (platform === "win32") {
-        const xaml = `
-        <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-                Title="${CONFIG.WINDOW_TITLE}" Width="480" SizeToContent="Height" 
-                WindowStartupLocation="CenterScreen" Background="#F3F3F3" ResizeMode="NoResize" Topmost="True">
-            <StackPanel Margin="30,30,30,40">
-                <TextBlock Text="Connect to Anima MCP" FontSize="22" FontWeight="Bold" Margin="0,0,0,10"/>
-                <TextBlock Text="Please authenticate with your student credentials." TextWrapping="Wrap" Margin="0,0,0,25"/>
-                <Border Background="White" BorderBrush="#DDDDDD" BorderThickness="1" CornerRadius="5" Padding="20">
-                    <TextBlock Text="${userCode}" FontSize="32" FontWeight="ExtraBold" HorizontalAlignment="Center" Foreground="#0078D4"/>
-                </Border>
-                <Grid Margin="0,30,0,0">
-                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                    <Button Name="CopyBtn" Content="Copy Code" Grid.Column="0" Margin="0,0,8,0" Height="40"/>
-                    <Button Name="LaunchBtn" Content="Open Browser" Grid.Column="1" Margin="8,0,0,0" Height="40" Background="#0078D4" Foreground="White"/>
-                </Grid>
-            </StackPanel>
-        </Window>`;
+        const xaml = `<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Title="${CONFIG.WINDOW_TITLE}" Width="480" SizeToContent="Height" WindowStartupLocation="CenterScreen" Background="#F3F3F3" ResizeMode="NoResize" Topmost="True"><StackPanel Margin="30,30,30,40"><TextBlock Text="Connect to Anima MCP" FontSize="22" FontWeight="Bold" Margin="0,0,0,10"/><TextBlock Text="Please authenticate with your student credentials." TextWrapping="Wrap" Margin="0,0,0,25"/><Border Background="White" BorderBrush="#DDDDDD" BorderThickness="1" CornerRadius="5" Padding="20"><TextBlock Text="${userCode}" FontSize="32" FontWeight="ExtraBold" HorizontalAlignment="Center" Foreground="#0078D4"/></Border><Grid Margin="0,30,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><Button Name="CopyBtn" Content="Copy Code" Grid.Column="0" Margin="0,0,8,0" Height="40"/><Button Name="LaunchBtn" Content="Open Browser" Grid.Column="1" Margin="8,0,0,0" Height="40" Background="#0078D4" Foreground="White"/></Grid></StackPanel></Window>`;
         const xamlBase64 = Buffer.from(xaml).toString('base64');
-        const psScript = `
-            Add-Type -AssemblyName PresentationFramework;
-            $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader ([xml][System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${xamlBase64}')))));
-            $window.FindName('CopyBtn').Add_Click({ Set-Clipboard -Value '${userCode}' });
-            $window.FindName('LaunchBtn').Add_Click({ Set-Clipboard -Value '${userCode}'; Start-Process '${verificationUri}'; });
-            Set-Clipboard -Value '${userCode}';
-            $window.ShowDialog() | Out-Null;
-        `.replace(/\n/g, ' ');
+        const psScript = `Add-Type -AssemblyName PresentationFramework; $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader ([xml][System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${xamlBase64}'))))); $window.FindName('CopyBtn').Add_Click({ Set-Clipboard -Value '${userCode}' }); $window.FindName('LaunchBtn').Add_Click({ Set-Clipboard -Value '${userCode}'; Start-Process '${verificationUri}'; }); Set-Clipboard -Value '${userCode}'; $window.ShowDialog() | Out-Null;`.replace(/\n/g, ' ');
         activeGuiProcess = spawn("powershell.exe", ["-NoProfile", "-Command", psScript]);
-    } 
-    else if (platform === "darwin") {
-        const appleScript = `
-            set theCode to "${userCode}"
-            set the clipboard to theCode
-            display dialog "To connect to Anima MCP, use this code in your browser:\\n\\n" & theCode & "\\n\\nThe code has been copied to your clipboard." with title "Anima MCP Auth" buttons {"Open Browser", "Cancel"} default button "Open Browser"
-            if button returned of result is "Open Browser" then
-                open location "${verificationUri}"
-            end if
-        `;
+    } else if (platform === "darwin") {
+        const appleScript = `set theCode to "${userCode}"\nset the clipboard to theCode\ndisplay dialog "To connect to Anima MCP, use this code in your browser:\\n\\n" & theCode & "\\n\\nThe code has been copied to your clipboard." with title "Anima MCP Auth" buttons {"Open Browser", "Cancel"} default button "Open Browser"\nif button returned of result is "Open Browser" then\nopen location "${verificationUri}"\nend if`;
         activeGuiProcess = spawn("osascript", ["-e", appleScript]);
-    } 
-    else {
-        log(`\n=== AUTH REQUIRED ===\nCODE: ${userCode}\nURL: ${verificationUri}\n====================\n`, "WARN");
     }
 }
-
 function askConsent() {
     if (process.platform === "win32") {
         const psScript = `Add-Type -AssemblyName PresentationFramework; $res = [System.Windows.MessageBox]::Show('Connect to Anima MCP?', 'Anima MCP', 'YesNo', 'Information'); if ($res -eq 'Yes') { exit 0 } else { exit 1 }`;
         return spawnSync("powershell.exe", ["-NoProfile", "-Command", psScript]).status === 0;
-    } else if (process.platform === "darwin") {
-        try {
-            execSync(`osascript -e 'display dialog "Connect to Anima MCP?" with title "Anima MCP" buttons {"No", "Yes"} default button "Yes"'`);
-            return true;
-        } catch (e) { return false; }
     }
     return true; 
 }
-
 function request(url, method, headers, body) {
     return new Promise((resolve) => {
-        const urlObj = new URL(url);
-        if (!ALLOWED_HOSTS.includes(urlObj.hostname)) {
-            log(`Blocked request to unauthorized host: ${urlObj.hostname}`, "ERROR");
-            return resolve({ status: 403, data: { error: "Security validation failed" } });
-        }
-
         const payload = typeof body === "string" ? body : JSON.stringify(body);
-        const options = {
-            method,
-            headers: { ...headers, "Content-Length": Buffer.byteLength(payload), "User-Agent": CONFIG.USER_AGENT },
-            timeout: CONFIG.REQUEST_TIMEOUT
-        };
-
-        const req = https.request(url, options, (res) => {
+        const req = https.request(url, { method, headers: { ...headers, "Content-Length": Buffer.byteLength(payload), "User-Agent": CONFIG.USER_AGENT }, timeout: CONFIG.REQUEST_TIMEOUT }, (res) => {
             let data = "";
             res.on("data", (chunk) => (data += chunk));
-            res.on("end", () => {
-                try { resolve({ status: res.statusCode, data: JSON.parse(data || "{}") }); }
-                catch (e) { resolve({ status: res.statusCode, data: { raw: data.substring(0, 100) } }); }
-            });
+            res.on("end", () => { try { resolve({ status: res.statusCode, data: JSON.parse(data || "{}") }); } catch (e) { resolve({ status: res.statusCode, data: { raw: data } }); } });
         });
-
-        req.on("timeout", () => { req.destroy(); resolve({ status: 408, data: { error: "Timeout" } }); });
         req.on("error", (e) => resolve({ status: 500, data: { error: e.message } }));
         req.write(payload);
         req.end();
     });
 }
 
-function loadCache() {
-    if (fs.existsSync(CONFIG.CACHE_PATH)) {
-        try {
-            const encryptedData = fs.readFileSync(CONFIG.CACHE_PATH, "utf8");
-            const decrypted = decrypt(encryptedData);
-            if (decrypted) return JSON.parse(decrypted);
-        } catch (e) { log("Cache read error.", "WARN"); }
-    }
-    return {};
-}
-
-function saveCache(data) {
-    try {
-        const existing = loadCache();
-        const updated = { ...existing, ...data };
-        fs.writeFileSync(CONFIG.CACHE_PATH, encrypt(JSON.stringify(updated)));
-    } catch (e) { log("Cache write error.", "ERROR"); }
-}
-
+// --- Auth Logic ---
 async function getValidToken() {
     const cache = loadCache();
-    
-    // 1. Check if current access token is still valid
-    if (cache.entra && cache.entra.access_token && Date.now() < (cache.entra.expires_at - 60000)) {
-        return cache.entra.access_token;
-    }
-
-    // 2. Try to refresh using Refresh Token if available
-    if (cache.entra && cache.entra.refresh_token) {
-        log("Attempting to refresh Microsoft Entra token...", "INFO");
-        const refreshRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST",
-            { "Content-Type": "application/x-www-form-urlencoded" },
-            `grant_type=refresh_token&client_id=${CONFIG.CLIENT_ID}&refresh_token=${cache.entra.refresh_token}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`
-        );
-
-        if (refreshRes.data.access_token) {
-            const entraData = { 
-                access_token: refreshRes.data.access_token, 
-                refresh_token: refreshRes.data.refresh_token || cache.entra.refresh_token,
-                expires_at: Date.now() + (refreshRes.data.expires_in * 1000) 
-            };
-            saveCache({ entra: entraData });
-            log("Microsoft token refreshed successfully.", "AUDIT");
-            return refreshRes.data.access_token;
+    if (cache.entra?.access_token && Date.now() < (cache.entra.expires_at - 120000)) return cache.entra.access_token;
+    if (cache.entra?.refresh_token) {
+        log("Refreshing Microsoft Entra token...", "INFO");
+        const res = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST", { "Content-Type": "application/x-www-form-urlencoded" }, `grant_type=refresh_token&client_id=${CONFIG.CLIENT_ID}&refresh_token=${cache.entra.refresh_token}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`);
+        if (res.data.access_token) {
+            const data = { access_token: res.data.access_token, refresh_token: res.data.refresh_token || cache.entra.refresh_token, expires_at: Date.now() + (res.data.expires_in * 1000) };
+            saveCache({ entra: data });
+            return data.access_token;
         }
-        log("Refresh token expired or invalid. Starting new login flow...", "WARN");
     }
-
-    // 3. Fallback to Device Code Flow
     if (!askConsent()) throw new Error("User declined authentication.");
-
-    const deviceRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/devicecode`, "POST", 
-        { "Content-Type": "application/x-www-form-urlencoded" }, 
-        `client_id=${CONFIG.CLIENT_ID}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`
-    );
-
-    if (!deviceRes.data.user_code) throw new Error("Microsoft Entra ID communication failure.");
-
+    const deviceRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/devicecode`, "POST", { "Content-Type": "application/x-www-form-urlencoded" }, `client_id=${CONFIG.CLIENT_ID}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`);
     showAuthGui(deviceRes.data.user_code, "https://login.microsoftonline.com/common/oauth2/deviceauth");
-    log(`Awaiting authentication (Code: ${deviceRes.data.user_code})...`);
-    
     const startTime = Date.now();
     while (true) {
-        if ((Date.now() - startTime) / 1000 > CONFIG.MAX_AUTH_POLLING_SEC) {
-            cleanup();
-            throw new Error("Authentication timed out.");
-        }
+        if ((Date.now() - startTime) / 1000 > CONFIG.MAX_AUTH_POLLING_SEC) { cleanupGui(); throw new Error("Authentication timed out."); }
         await new Promise(r => setTimeout(r, 5000));
-        const tokenRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST",
-            { "Content-Type": "application/x-www-form-urlencoded" },
-            `grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=${CONFIG.CLIENT_ID}&device_code=${deviceRes.data.device_code}`
-        );
-
-        if (tokenRes.data.access_token) {
-            cleanup();
-            const entraData = { 
-                access_token: tokenRes.data.access_token, 
-                refresh_token: tokenRes.data.refresh_token,
-                expires_at: Date.now() + (tokenRes.data.expires_in * 1000) 
-            };
-            saveCache({ entra: entraData });
-            log("Microsoft authentication successful.", "AUDIT");
-            return tokenRes.data.access_token;
-        }
-        if (tokenRes.data.error !== "authorization_pending") {
-            cleanup();
-            throw new Error(tokenRes.data.error_description || "Auth failed.");
-        }
+        const tRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST", { "Content-Type": "application/x-www-form-urlencoded" }, `grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=${CONFIG.CLIENT_ID}&device_code=${deviceRes.data.device_code}`);
+        if (tRes.data.access_token) { cleanupGui(); const data = { access_token: tRes.data.access_token, refresh_token: tRes.data.refresh_token, expires_at: Date.now() + (tRes.data.expires_in * 1000) }; saveCache({ entra: data }); return data.access_token; }
     }
 }
-
 async function getValidPAT(entraToken) {
     const cache = loadCache();
-    if (cache.pat && cache.pat.token && Date.now() < (cache.pat.expires_at - 30000)) {
-        return cache.pat;
-    }
-
+    if (cache.pat?.token && Date.now() < (cache.pat.expires_at - CONFIG.RESTART_BUFFER_MS)) return cache.pat;
     log("Requesting new PAT from backend...", "INFO");
-    const patRes = await request(CONFIG.PAT_URL, "POST", { 
-        "Authorization": `Bearer ${entraToken}`, 
-        "Content-Type": "application/json" 
-    }, {});
-
-    const token = patRes.data.personalAccessToken;
-    if (!token) throw new Error(`Backend returned ${patRes.status}. Check permissions.`);
-
-    const ttlSeconds = patRes.data.expiresIn || patRes.data.ttlSeconds || CONFIG.DEFAULT_PAT_TTL;
-    const patData = {
-        token: token,
-        expires_at: Date.now() + (ttlSeconds * 1000)
-    };
-
+    const res = await request(CONFIG.PAT_URL, "POST", { "Authorization": `Bearer ${entraToken}`, "Content-Type": "application/json" }, {});
+    const patData = { token: res.data.personalAccessToken, expires_at: Date.now() + ((res.data.expiresIn || CONFIG.DEFAULT_PAT_TTL) * 1000) };
     saveCache({ pat: patData });
     return patData;
 }
 
-async function start() {
-    try {
-        const entraToken = await getValidToken();
-        const patData = await getValidPAT(entraToken);
+// --- Seamless Bridge Logic ---
+let mcpProcess = null;
+let setupSequence = []; 
+let hasHandshakeCompleted = false;
+let isIntentionalRestart = false;
 
-        log(`BRIDGE ACTIVE. PAT expires in ${Math.round((patData.expires_at - Date.now()) / 1000)}s.`, "INFO");
-        
-        const timeUntilExpiry = patData.expires_at - Date.now();
-        const exitBuffer = CONFIG.EXPIRY_BUFFER_SEC * 1000; 
-        
-        if (timeUntilExpiry > exitBuffer) {
-            setTimeout(() => {
-                log("PAT approaching expiration. Restarting bridge to refresh token...", "WARN");
-                cleanup(); // Kill child process before exiting
-                process.exit(0); 
-            }, timeUntilExpiry - exitBuffer);
-        }
-
-        // Fix: Removed space after colon in headers to prevent double-spacing issues
-        if (process.platform === "win32") {
-            const cmd = `npx -y --quiet ${CONFIG.PINNED_MCP_REMOTE_VER} ${CONFIG.REMOTE_MCP_URL} --header "Authorization:Bearer ${patData.token}" --header "Accept:application/json"`;
-            mcpProcess = spawn(cmd, [], { 
-                shell: true, 
-                stdio: ["inherit", "inherit", "pipe"],
-                env: { ...process.env, NO_UPDATE_NOTIFIER: "true" }
-            });
-        } else {
-            const args = ["-y", "--quiet", CONFIG.PINNED_MCP_REMOTE_VER, CONFIG.REMOTE_MCP_URL, "--header", `Authorization:Bearer ${patData.token}`, "--header", "Accept:application/json"];
-            mcpProcess = spawn("npx", args, { stdio: ["inherit", "inherit", "pipe"] });
-        }
-
-        mcpProcess.stderr.on("data", (d) => process.stderr.write(d));
-        mcpProcess.on("error", (err) => {
-            log(`Failed to start MCP: ${err.message}`, "ERROR");
-            process.exit(1);
-        });
-        mcpProcess.on("exit", (code) => {
-            log(`MCP exited with code ${code}`, "INFO");
-            process.exit(code || 0);
-        });
-
-    } catch (err) {
-        log(`Fatal Error: ${err.message}`, "ERROR");
-        cleanup();
-        process.exit(1);
+function killMcpChild() {
+    if (mcpProcess) {
+        isIntentionalRestart = true;
+        try {
+            if (process.platform === "win32") spawnSync("taskkill", ["/PID", mcpProcess.pid, "/F", "/T"], { stdio: 'ignore' });
+            else mcpProcess.kill();
+        } catch (e) {}
+        mcpProcess = null;
     }
 }
 
-start();
+process.stdin.on("data", (chunk) => {
+    const str = chunk.toString();
+    if (str.includes('"method":"initialize"') || 
+        str.includes('"method":"notifications/initialized"') || 
+        str.includes('"method":"tools/list"')) {
+        setupSequence.push(chunk);
+    }
+    if (mcpProcess && mcpProcess.stdin.writable) mcpProcess.stdin.write(chunk);
+});
+
+async function startMcpChild() {
+    const entraToken = await getValidToken();
+    const patData = await getValidPAT(entraToken);
+    
+    killMcpChild();
+    isIntentionalRestart = false;
+
+    const timeUntilExpiry = patData.expires_at - Date.now();
+    log(`BRIDGE ACTIVE. PAT expires in ${Math.round(timeUntilExpiry / 1000)}s.`, "INFO");
+
+    let cmd, args;
+    if (process.platform === "win32") {
+        cmd = `npx -y --quiet ${CONFIG.PINNED_MCP_REMOTE_VER} ${CONFIG.REMOTE_MCP_URL} --header "Authorization:Bearer ${patData.token}" --header "Accept:application/json"`;
+        args = [];
+    } else {
+        cmd = "npx";
+        args = ["-y", "--quiet", CONFIG.PINNED_MCP_REMOTE_VER, CONFIG.REMOTE_MCP_URL, "--header", `Authorization:Bearer ${patData.token}`, "--header", "Accept:application/json"];
+    }
+    
+    mcpProcess = spawn(cmd, args, { shell: process.platform === "win32", stdio: ["pipe", "pipe", "pipe"] });
+
+    if (setupSequence.length > 0) {
+        // Delay replay slightly to allow mcp-remote to establish its own connection
+        setTimeout(() => {
+            if (!mcpProcess) return;
+            log("Replaying setup sequence to new process...", "DEBUG");
+            for (const msg of setupSequence) mcpProcess.stdin.write(msg);
+        }, 500);
+    }
+
+    const rl = readline.createInterface({ input: mcpProcess.stdout, terminal: false });
+    rl.on("line", (line) => {
+        if (!line.trim()) return;
+        if (line.trim().startsWith('{')) {
+            if (line.includes('"result":{"protocolVersion"') || line.includes('"result":{"tools"')) {
+                if (hasHandshakeCompleted) return;
+                if (line.includes('"result":{"tools"')) hasHandshakeCompleted = true;
+            }
+            process.stdout.write(line + "\n");
+        } else {
+            process.stderr.write(`[mcp-remote] ${line}\n`);
+        }
+    });
+
+    mcpProcess.stderr.on("data", (d) => process.stderr.write(d));
+    mcpProcess.on("exit", (code) => { 
+        if (code !== null && code !== 0 && !isIntentionalRestart) {
+            log(`MCP child exited with code ${code}`, "ERROR");
+            if (!hasHandshakeCompleted) process.exit(code);
+        }
+    });
+
+    const refreshIn = Math.max(1000, timeUntilExpiry - CONFIG.RESTART_BUFFER_MS);
+    setTimeout(() => { log("Refreshing PAT seamlessly...", "WARN"); startMcpChild(); }, refreshIn);
+}
+
+process.on("SIGINT", () => { killMcpChild(); cleanupGui(); process.exit(0); });
+process.on("SIGTERM", () => { killMcpChild(); cleanupGui(); process.exit(0); });
+startMcpChild().catch(err => { log(`Fatal: ${err.message}`, "ERROR"); killMcpChild(); cleanupGui(); process.exit(1); });
