@@ -3,11 +3,11 @@
 /**
  * @file anima-mcp-bridge.js
  * @description Bridge between Microsoft Entra ID and Anima MCP Server.
- * @version 1.1.7 (Final Seamless Bridge)
+ * @version 1.1.8 (Seamless Bridge with Exponential Backoff)
  * @license GPL-3.0
  */
 
-const { spawn, spawnSync, execSync } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
@@ -23,16 +23,21 @@ const CONFIG = {
     REMOTE_MCP_URL: process.env.ANIMA_MCP_URL || "https://cloudapp-dev.animaeducacao.com.br/servico-hackathon-mcp/mcp",
     CACHE_PATH: path.join(os.homedir(), ".anima-mcp-cache.enc"),
     WINDOW_TITLE: "AnimaMCPAuth",
-    USER_AGENT: "Anima-MCP-Bridge/1.1.7",
+    USER_AGENT: "Anima-MCP-Bridge/1.1.8",
     PINNED_MCP_REMOTE_VER: "mcp-remote@0.1.3",
     REQUEST_TIMEOUT: 15000,
     MAX_AUTH_POLLING_SEC: 900,
     DEFAULT_PAT_TTL: 900,
-    // Production Buffer: Refresh 2 minutes before PAT expires
-    RESTART_BUFFER_MS: 120000 
+    RESTART_BUFFER_MS: 120000,
+    // Retry Configuration
+    RETRY: {
+        MAX_RETRIES: 5,
+        INITIAL_DELAY_MS: 1000,
+        MAX_DELAY_MS: 30000,
+        RETRYABLE_STATUS_CODES: [401, 403, 408, 429, 500, 502, 503, 504]
+    }
 };
 
-const ALLOWED_HOSTS = ["login.microsoftonline.com", "cloudapp-dev.animaeducacao.com.br"];
 const correlationId = crypto.randomBytes(4).toString('hex');
 
 const log = (msg, level = "INFO") => {
@@ -84,6 +89,7 @@ function cleanupGui() {
     } catch (e) { }
     activeGuiProcess = null;
 }
+
 function showAuthGui(userCode, verificationUri) {
     const platform = process.platform;
     if (platform === "win32") {
@@ -96,6 +102,7 @@ function showAuthGui(userCode, verificationUri) {
         activeGuiProcess = spawn("osascript", ["-e", appleScript]);
     }
 }
+
 function askConsent() {
     if (process.platform === "win32") {
         const psScript = `Add-Type -AssemblyName PresentationFramework; $res = [System.Windows.MessageBox]::Show('Connect to Anima MCP?', 'Anima MCP', 'YesNo', 'Information'); if ($res -eq 'Yes') { exit 0 } else { exit 1 }`;
@@ -103,6 +110,7 @@ function askConsent() {
     }
     return true; 
 }
+
 function request(url, method, headers, body) {
     return new Promise((resolve) => {
         const payload = typeof body === "string" ? body : JSON.stringify(body);
@@ -117,36 +125,111 @@ function request(url, method, headers, body) {
     });
 }
 
+/**
+ * Executes a request with Exponential Backoff and Jitter
+ */
+async function requestWithRetry(url, method, headers, body) {
+    let attempt = 0;
+    while (attempt < CONFIG.RETRY.MAX_RETRIES) {
+        const response = await request(url, method, headers, body);
+        
+        // Success
+        if (response.status >= 200 && response.status < 300) return response;
+
+        // Check if status is retryable
+        if (!CONFIG.RETRY.RETRYABLE_STATUS_CODES.includes(response.status)) return response;
+
+        attempt++;
+        if (attempt >= CONFIG.RETRY.MAX_RETRIES) return response;
+
+        // Exponential backoff: delay = min(max_delay, initial * 2^attempt) + random_jitter
+        const backoff = Math.min(CONFIG.RETRY.MAX_DELAY_MS, CONFIG.RETRY.INITIAL_DELAY_MS * Math.pow(2, attempt));
+        const jitter = Math.random() * 1000;
+        const totalDelay = backoff + jitter;
+
+        log(`Request failed (${response.status}). Retrying in ${Math.round(totalDelay)}ms... (Attempt ${attempt}/${CONFIG.RETRY.MAX_RETRIES})`, "WARN");
+        await new Promise(resolve => setTimeout(resolve, totalDelay));
+    }
+}
+
 // --- Auth Logic ---
 async function getValidToken() {
     const cache = loadCache();
     if (cache.entra?.access_token && Date.now() < (cache.entra.expires_at - 120000)) return cache.entra.access_token;
+    
     if (cache.entra?.refresh_token) {
         log("Refreshing Microsoft Entra token...", "INFO");
-        const res = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST", { "Content-Type": "application/x-www-form-urlencoded" }, `grant_type=refresh_token&client_id=${CONFIG.CLIENT_ID}&refresh_token=${cache.entra.refresh_token}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`);
+        const res = await requestWithRetry(
+            `https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, 
+            "POST", 
+            { "Content-Type": "application/x-www-form-urlencoded" }, 
+            `grant_type=refresh_token&client_id=${CONFIG.CLIENT_ID}&refresh_token=${cache.entra.refresh_token}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`
+        );
+        
         if (res.data.access_token) {
             const data = { access_token: res.data.access_token, refresh_token: res.data.refresh_token || cache.entra.refresh_token, expires_at: Date.now() + (res.data.expires_in * 1000) };
             saveCache({ entra: data });
             return data.access_token;
         }
     }
+
     if (!askConsent()) throw new Error("User declined authentication.");
-    const deviceRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/devicecode`, "POST", { "Content-Type": "application/x-www-form-urlencoded" }, `client_id=${CONFIG.CLIENT_ID}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`);
+    
+    // Initial Device Code Request
+    const deviceRes = await requestWithRetry(
+        `https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/devicecode`, 
+        "POST", 
+        { "Content-Type": "application/x-www-form-urlencoded" }, 
+        `client_id=${CONFIG.CLIENT_ID}&scope=${encodeURIComponent(CONFIG.API_SCOPE + " offline_access openid profile")}`
+    );
+
+    if (!deviceRes.data.user_code) throw new Error("Failed to initiate device code flow.");
+
     showAuthGui(deviceRes.data.user_code, "https://login.microsoftonline.com/common/oauth2/deviceauth");
+    
     const startTime = Date.now();
     while (true) {
         if ((Date.now() - startTime) / 1000 > CONFIG.MAX_AUTH_POLLING_SEC) { cleanupGui(); throw new Error("Authentication timed out."); }
         await new Promise(r => setTimeout(r, 5000));
+        
+        // We do not use exponential backoff for polling, as it has its own interval logic (5s)
         const tRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST", { "Content-Type": "application/x-www-form-urlencoded" }, `grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=${CONFIG.CLIENT_ID}&device_code=${deviceRes.data.device_code}`);
-        if (tRes.data.access_token) { cleanupGui(); const data = { access_token: tRes.data.access_token, refresh_token: tRes.data.refresh_token, expires_at: Date.now() + (tRes.data.expires_in * 1000) }; saveCache({ entra: data }); return data.access_token; }
+        
+        if (tRes.data.access_token) { 
+            cleanupGui(); 
+            const data = { access_token: tRes.data.access_token, refresh_token: tRes.data.refresh_token, expires_at: Date.now() + (tRes.data.expires_in * 1000) }; 
+            saveCache({ entra: data }); 
+            return data.access_token; 
+        }
+
+        // If error is not "authorization_pending", stop polling
+        if (tRes.data.error && tRes.data.error !== "authorization_pending") {
+            cleanupGui();
+            throw new Error(`Auth failed: ${tRes.data.error_description || tRes.data.error}`);
+        }
     }
 }
+
 async function getValidPAT(entraToken) {
     const cache = loadCache();
     if (cache.pat?.token && Date.now() < (cache.pat.expires_at - CONFIG.RESTART_BUFFER_MS)) return cache.pat;
+    
     log("Requesting new PAT from backend...", "INFO");
-    const res = await request(CONFIG.PAT_URL, "POST", { "Authorization": `Bearer ${entraToken}`, "Content-Type": "application/json" }, {});
-    const patData = { token: res.data.personalAccessToken, expires_at: Date.now() + ((res.data.expiresIn || CONFIG.DEFAULT_PAT_TTL) * 1000) };
+    const res = await requestWithRetry(
+        CONFIG.PAT_URL, 
+        "POST", 
+        { "Authorization": `Bearer ${entraToken}`, "Content-Type": "application/json" }, 
+        {}
+    );
+
+    if (!res.data.personalAccessToken) {
+        throw new Error(`Failed to retrieve PAT: Status ${res.status}`);
+    }
+
+    const patData = { 
+        token: res.data.personalAccessToken, 
+        expires_at: Date.now() + ((res.data.expiresIn || CONFIG.DEFAULT_PAT_TTL) * 1000) 
+    };
     saveCache({ pat: patData });
     return patData;
 }
@@ -200,7 +283,6 @@ async function startMcpChild() {
     mcpProcess = spawn(cmd, args, { shell: process.platform === "win32", stdio: ["pipe", "pipe", "pipe"] });
 
     if (setupSequence.length > 0) {
-        // Delay replay slightly to allow mcp-remote to establish its own connection
         setTimeout(() => {
             if (!mcpProcess) return;
             log("Replaying setup sequence to new process...", "DEBUG");
