@@ -3,7 +3,7 @@
 /**
  * @file anima-mcp-bridge.js
  * @description Bridge between Microsoft Entra ID and Anima MCP Server.
- * @version 1.1.8 (Seamless Bridge with Exponential Backoff)
+ * @version 1.1.8 (Ânima MCP bridge)
  * @license GPL-3.0
  */
 
@@ -29,7 +29,6 @@ const CONFIG = {
     MAX_AUTH_POLLING_SEC: 900,
     DEFAULT_PAT_TTL: 900,
     RESTART_BUFFER_MS: 120000,
-    // Retry Configuration
     RETRY: {
         MAX_RETRIES: 5,
         INITIAL_DELAY_MS: 1000,
@@ -45,7 +44,6 @@ const log = (msg, level = "INFO") => {
     process.stderr.write(`[${timestamp}] [${correlationId}] [${level}] ${msg}\n`);
 };
 
-// --- Encryption & Cache ---
 function getEncryptionKey() {
     const machineFingerprint = os.userInfo().username + os.homedir();
     return crypto.scryptSync(machineFingerprint, 'anima-salt-v1', 32);
@@ -79,7 +77,6 @@ function saveCache(data) {
     fs.writeFileSync(CONFIG.CACHE_PATH, encrypt(JSON.stringify(updated)));
 }
 
-// --- GUI & Network ---
 let activeGuiProcess = null;
 function cleanupGui() {
     if (!activeGuiProcess) return;
@@ -125,24 +122,18 @@ function request(url, method, headers, body) {
     });
 }
 
-/**
- * Executes a request with Exponential Backoff and Jitter
- */
 async function requestWithRetry(url, method, headers, body) {
     let attempt = 0;
     while (attempt < CONFIG.RETRY.MAX_RETRIES) {
         const response = await request(url, method, headers, body);
         
-        // Success
         if (response.status >= 200 && response.status < 300) return response;
 
-        // Check if status is retryable
         if (!CONFIG.RETRY.RETRYABLE_STATUS_CODES.includes(response.status)) return response;
 
         attempt++;
         if (attempt >= CONFIG.RETRY.MAX_RETRIES) return response;
 
-        // Exponential backoff: delay = min(max_delay, initial * 2^attempt) + random_jitter
         const backoff = Math.min(CONFIG.RETRY.MAX_DELAY_MS, CONFIG.RETRY.INITIAL_DELAY_MS * Math.pow(2, attempt));
         const jitter = Math.random() * 1000;
         const totalDelay = backoff + jitter;
@@ -152,7 +143,6 @@ async function requestWithRetry(url, method, headers, body) {
     }
 }
 
-// --- Auth Logic ---
 async function getValidToken() {
     const cache = loadCache();
     if (cache.entra?.access_token && Date.now() < (cache.entra.expires_at - 120000)) return cache.entra.access_token;
@@ -175,7 +165,6 @@ async function getValidToken() {
 
     if (!askConsent()) throw new Error("User declined authentication.");
     
-    // Initial Device Code Request
     const deviceRes = await requestWithRetry(
         `https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/devicecode`, 
         "POST", 
@@ -192,7 +181,6 @@ async function getValidToken() {
         if ((Date.now() - startTime) / 1000 > CONFIG.MAX_AUTH_POLLING_SEC) { cleanupGui(); throw new Error("Authentication timed out."); }
         await new Promise(r => setTimeout(r, 5000));
         
-        // We do not use exponential backoff for polling, as it has its own interval logic (5s)
         const tRes = await request(`https://login.microsoftonline.com/${CONFIG.TENANT_ID}/oauth2/v2.0/token`, "POST", { "Content-Type": "application/x-www-form-urlencoded" }, `grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=${CONFIG.CLIENT_ID}&device_code=${deviceRes.data.device_code}`);
         
         if (tRes.data.access_token) { 
@@ -202,7 +190,6 @@ async function getValidToken() {
             return data.access_token; 
         }
 
-        // If error is not "authorization_pending", stop polling
         if (tRes.data.error && tRes.data.error !== "authorization_pending") {
             cleanupGui();
             throw new Error(`Auth failed: ${tRes.data.error_description || tRes.data.error}`);
@@ -234,7 +221,6 @@ async function getValidPAT(entraToken) {
     return patData;
 }
 
-// --- Seamless Bridge Logic ---
 let mcpProcess = null;
 let setupSequence = []; 
 let hasHandshakeCompleted = false;
